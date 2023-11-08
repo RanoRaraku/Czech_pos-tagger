@@ -30,7 +30,6 @@ from torch.utils.data import DataLoader, Dataset
 #   - methods to convert it to a DataLoader and a collate() function
 
 
-
 class Factor:
     def __init__(self) -> None:
         self.strings = []

@@ -118,7 +118,7 @@ class PositionEncoding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Expect `x` to be tensor of shape [T,C] or [B,T,C].
+        Expect `x` to be tensor of shape [T,F] or [B,T,F].
         """
         if x.dim() == 2:
             k_dim = 0
@@ -298,7 +298,7 @@ class Transformer(nn.Module):
         self.epoch = 0
 
         # Encoder
-        self.encoder_input = InputLayer(
+        self.encoder_input_layer = InputLayer(
             args["input_vocab_size"],
             args["model_dim"],
             args["max_seq_len"],
@@ -319,7 +319,7 @@ class Transformer(nn.Module):
         )
 
         # Decoder
-        self.decoder_input = InputLayer(
+        self.decoder_input_layer = InputLayer(
             args["num_classes"],
             args["model_dim"],
             args["max_seq_len"],
@@ -339,48 +339,89 @@ class Transformer(nn.Module):
             ]
         )
 
-        self.out = nn.Linear(args["model_dim"], args["num_classes"], device=self.device)
+        self.output_layer = nn.Linear(
+            args["model_dim"], args["num_classes"], device=self.device
+        )
 
     def forward(
         self,
-        inputs: torch.Tensor,
-        outputs: Optional[torch.Tensor] = None,
+        encoder_inputs: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
         max_seq_len: int = 50,
     ) -> torch.Tensor:
         """
         Assume 0 is <BOS> and 1 is <EOS> token.
         """
         # Encoder
-        e = self.encoder_input(inputs)
-        e = self.encoder_stack(e)
+        encoder_outputs = self.encoder_input_layer(encoder_inputs)
+        encoder_outputs = self.encoder_stack(encoder_outputs)
 
         # Decoder
-        if outputs is not None:
+        if targets is not None:
             # TRAIN: teacher forcing with self_att causal mask
-            d = self.decoder_input(outputs)
+            decoder_outputs = self.decoder_input_layer(targets)
             for decoder in self.decoder_stack:
-                d = decoder(d, e, True)
-            out = self.out(d)
+                decoder_outputs = decoder(decoder_outputs, encoder_outputs, True)
+            out = self.out_layer(decoder_outputs)
         else:
             # INFERENCE: auto-regressive decoding
-            batch_size = inputs.size(0)
+            batch_size = encoder_inputs.size(0)
             decoder_inputs = torch.zeros(
                 batch_size, 1, dtype=torch.long, device=self.device
             )
-
-            for _ in range(max_seq_len):
-                d = self.decoder_input(decoder_inputs)
-                for decoder in self.decoder_stack:
-                    d = decoder(d, e, True)
-                out = self.out(d)
-                next_tokens = self.greedy_decoding(out[:, -1])
-                decoder_inputs = torch.cat((decoder_inputs, next_tokens), dim=1)
+            out = self.greedy_search(max_seq_len, encoder_outputs, decoder_inputs)
 
         return out
 
-    def greedy_decoding(self, token_pdf: torch.Tensor):
-        _, topi = token_pdf.topk(1)
-        return topi.detach()
+    def _decoder_stack_forward(self, encoder_outputs, decoder_inputs):
+        decoder_outputs = self.decoder_input_layer(decoder_inputs)
+        for decoder in self.decoder_stack:
+            decoder_outputs = decoder(decoder_outputs, encoder_outputs, True)
+        out = self.output_layer(decoder_outputs)
+        return out
+
+    def greedy_search(
+        self,
+        max_seq_len: int,
+        encoder_outputs: torch.Tensor,
+        decoder_inputs: torch.Tensor,
+    ):
+        """
+        Simple greedy top 1 search and auto-regressive decoding. Output is a tensor of
+        shape (B,T,F).
+        """
+        for _ in range(max_seq_len):
+            out = self._decoder_stack_forward(encoder_outputs, decoder_inputs)
+            _, topi = out[:, -1].topk(1)
+            next_tokens = topi.detach()
+            decoder_inputs = torch.cat((decoder_inputs, next_tokens), dim=1)
+
+        return out
+
+    def beam_search(
+        self,
+        max_seq_len: int,
+        beam_width: int,
+        encoder_outputs: torch.Tensor,
+        decoder_inputs: torch.Tensor,
+    ):
+        ...
+
+    def topk_sampling(
+        self,
+        max_seq_len: int,
+        encoder_outputs: torch.Tensor,
+        decoder_inputs: torch.Tensor,
+    ):
+        ...
+
+    def nucleus_sampling(
+        self,
+        max_seq_len: int,
+        encoder_outputs: torch.Tensor,
+        decoder_inputs: torch.Tensor,
+    ):
+        ...
 
 
 def eval_accuracy(model, dloader):
@@ -433,7 +474,7 @@ def train_epoch(
     start_time = time.time()
     model.train()
     for batch in train_dataloader:
-        words = batch["words"].to(model.device)
+        encoder_inputs = batch["words"].to(model.device)
         tags = batch["tags"].to(model.device)
         words_num = batch["words_num"].to(model.device) - 1
 
@@ -443,10 +484,10 @@ def train_epoch(
         ) < words_num.unsqueeze(1)
 
         # Run inference
-        input_targets = tags[:, :-1]
-        output_targets = tags[:, 1:]
-        y_hat = model(words, input_targets)
-        loss = loss_fn(y_hat[mask], output_targets[mask])
+        decoder_inputs = tags[:, :-1]
+        decoder_targets = tags[:, 1:]
+        y_hat = model(encoder_inputs, decoder_inputs)
+        loss = loss_fn(y_hat[mask], decoder_targets[mask])
 
         # Update params
         optim.zero_grad()
@@ -461,7 +502,7 @@ def train_epoch(
     model.eval()
     with torch.no_grad():
         for batch in dev_dataloader:
-            words = batch["words"].to(model.device)
+            encoder_inputs = batch["words"].to(model.device)
             tags = batch["tags"].to(model.device)
             words_num = batch["words_num"].to(model.device) - 1
 
@@ -471,14 +512,14 @@ def train_epoch(
             ) < words_num.unsqueeze(1)
 
             # Run inference
-            input_targets = tags[:, :-1]
-            output_targets = tags[:, 1:]
-            y_hat = model(words, input_targets)
-            loss = loss_fn(y_hat[mask], output_targets[mask])
+            decoder_inputs = tags[:, :-1]
+            decoder_targets = tags[:, 1:]
+            y_hat = model(encoder_inputs, decoder_inputs)
+            loss = loss_fn(y_hat[mask], decoder_targets[mask])
 
             dev_loss += loss.detach().item()
             dev_corr += torch.sum(
-                torch.argmax(y_hat[mask], dim=-1) == output_targets[mask]
+                torch.argmax(y_hat[mask], dim=-1) == decoder_targets[mask]
             )
             dev_samples += torch.sum(words_num)
     dev_acc = dev_corr / dev_samples
