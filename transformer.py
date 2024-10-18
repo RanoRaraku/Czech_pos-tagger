@@ -30,11 +30,14 @@ class ScaledDotAttention(nn.Module):
         device: str = "cpu",
     ):
         super(ScaledDotAttention, self).__init__()
+
+        self.input_projection = AttentionProjection(model_dim, dk, dv, device)
         self.dk = torch.tensor(dk, dtype=torch.float32, device=device)
         if apply_Wo:
             self.Wo = nn.Linear(dv, model_dim, device=device)
         else:
             self.Wo = nn.Identity()
+
         self.device = device
 
     def forward(
@@ -45,16 +48,21 @@ class ScaledDotAttention(nn.Module):
         apply_mask: bool = False,
     ) -> torch.Tensor:
         B = keys.shape[0]
+        q, k, v = input_projection(query, keys, values)
+        
         scores = torch.bmm(query, keys.permute(0, 2, 1)) / torch.sqrt(self.dk)
+        
         if apply_mask:
             T = query.shape[1]
             mask = torch.triu(
                 torch.ones(B, T, T, dtype=torch.bool, device=self.device), 1
             )
             scores[mask] = float("-inf")
+        
         weights = nn.functional.softmax(scores, -1)
         context = torch.bmm(weights, values)
         context = self.Wo(context)
+        
         return context
 
 
@@ -167,49 +175,17 @@ class AttentionProjection(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None,
+        y: torch.Tensor,
+        z: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q = self.Wq(x)
-        K = self.Wk(y if y is not None else x)
-        V = self.Wv(z if z is not None else (y if y is not None else x))
+        K = self.Wk(y) 
+        V = self.Wv(z)
+        
         return q, K, V
 
 
-class MultiAttentionProjection(nn.Module):
-    def __init__(
-        self, model_dim: int, dk: int, dv: int, heads: int, device: str = "cpu"
-    ):
-        super(MultiAttentionProjection, self).__init__()
-        assert dk % heads == 0
-        assert dv % heads == 0
-
-        self.Wq = nn.ModuleList(
-            [nn.Linear(model_dim, int(dk / heads), device=device) for _ in range(heads)]
-        )
-        self.Wk = nn.ModuleList(
-            [nn.Linear(model_dim, int(dk / heads), device=device) for _ in range(heads)]
-        )
-        self.Wv = nn.ModuleList(
-            [nn.Linear(model_dim, int(dv / heads), device=device) for _ in range(heads)]
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        query, keys, values = [], [], []
-        for Wq, Wk, Wv in zip(self.Wq, self.Wk, self.Wv):
-            query.append(Wq(x))
-            keys.append(Wk(y if y is not None else x))
-            values.append(Wv(z if z is not None else (y if y is not None else x)))
-
-        return query, keys, values
-
-
-class Encoder(nn.Module):
+class EncoderLayer(nn.Module):
     def __init__(
         self,
         model_dim: int,
@@ -220,9 +196,6 @@ class Encoder(nn.Module):
     ) -> None:
         super(Encoder, self).__init__()
 
-        self.selfatt_projection = MultiAttentionProjection(
-            model_dim, keys_dim, values_dim, attention_heads, device
-        )
         self.selfatt = MultiHeadAttention(
             model_dim, keys_dim, values_dim, attention_heads, device
         )
@@ -231,8 +204,7 @@ class Encoder(nn.Module):
         self.ffn_norm = nn.LayerNorm(model_dim, device=device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        q, K, V = self.selfatt_projection(x)
-        c = self.selfatt(q, K, V, False)
+        c = self.selfatt(x, x, x, False)
         x = self.selfatt_norm(x + c)
         y = self.ffn(x)
         x = self.ffn_norm(x + y)
@@ -240,7 +212,7 @@ class Encoder(nn.Module):
         return x
 
 
-class Decoder(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(
         self,
         model_dim: int,
@@ -253,17 +225,11 @@ class Decoder(nn.Module):
         self.dk = keys_dim
         self.dv = values_dim
 
-        self.selfatt_projection = MultiAttentionProjection(
-            model_dim, self.dk, self.dv, attention_heads, device
-        )
         self.selfatt = MultiHeadAttention(
             model_dim, self.dk, self.dv, attention_heads, device
         )
         self.selfatt_norm = nn.LayerNorm(model_dim, device=device)
 
-        self.edatt_projection = MultiAttentionProjection(
-            model_dim, self.dk, self.dv, attention_heads, device
-        )
         self.edatt = MultiHeadAttention(
             model_dim, self.dk, self.dv, attention_heads, device
         )
@@ -275,14 +241,10 @@ class Decoder(nn.Module):
     def forward(
         self, inputs: torch.Tensor, encodings: torch.Tensor, apply_mask: bool = False
     ) -> torch.Tensor:
-        q, K, V = self.selfatt_projection(inputs)
-        x = self.selfatt(q, K, V, apply_mask)
+        x = self.selfatt(inputs, inputs, inputs, apply_mask)
         x = self.selfatt_norm(x + inputs)
-
-        q, K, V = self.edatt_projection(x, encodings)
-        y = self.edatt(q, K, V, False)
+        y = self.edatt(x, encodings, encodings, False)
         y = self.edatt_norm(y + x)
-
         z = self.ffn(y)
         z = self.ffn_norm(z + y)
 
@@ -307,7 +269,7 @@ class Transformer(nn.Module):
         )
         self.encoder_stack = nn.Sequential(
             *[
-                Encoder(
+                EncoderLayer(
                     args["model_dim"],
                     args["keys_dim"],
                     args["values_dim"],
@@ -328,7 +290,7 @@ class Transformer(nn.Module):
         )
         self.decoder_stack = nn.ModuleList(
             [
-                Decoder(
+                DecoderLayer(
                     args["model_dim"],
                     args["keys_dim"],
                     args["values_dim"],
@@ -397,31 +359,3 @@ class Transformer(nn.Module):
             decoder_inputs = torch.cat((decoder_inputs, next_tokens), dim=1)
 
         return out
-
-    def beam_search(
-        self,
-        max_seq_len: int,
-        beam_width: int,
-        encoder_outputs: torch.Tensor,
-        decoder_inputs: torch.Tensor,
-    ):
-        ...
-
-    def topk_sampling(
-        self,
-        max_seq_len: int,
-        encoder_outputs: torch.Tensor,
-        decoder_inputs: torch.Tensor,
-    ):
-        ...
-
-    def nucleus_sampling(
-        self,
-        max_seq_len: int,
-        encoder_outputs: torch.Tensor,
-        decoder_inputs: torch.Tensor,
-    ):
-        ...
-
-
-
