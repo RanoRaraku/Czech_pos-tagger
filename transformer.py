@@ -48,10 +48,9 @@ class ScaledDotAttention(nn.Module):
         apply_mask: bool = False,
     ) -> torch.Tensor:
         B = keys.shape[0]
+        
         q, k, v = input_projection(query, keys, values)
-        
         scores = torch.bmm(query, keys.permute(0, 2, 1)) / torch.sqrt(self.dk)
-        
         if apply_mask:
             T = query.shape[1]
             mask = torch.triu(
@@ -65,6 +64,20 @@ class ScaledDotAttention(nn.Module):
         
         return context
 
+class AttentionProjection(nn.Module):
+    def __init__(self, model_dim: int, dk: int, dv: int, device: str = "cpu"):
+        super(AttentionProjection, self).__init__()
+        self.Wq = nn.Linear(model_dim, dk, False, device=device)
+        self.Wk = nn.Linear(model_dim, dk, False, device=device)
+        self.Wv = nn.Linear(model_dim, dv, False, device=device)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.Wq(q), self.Wk(k), self.Wv(v)
 
 class MultiHeadAttention(nn.Module):
     def __init__(
@@ -163,27 +176,6 @@ class InputLayer(nn.Module):
         x = self.position_encoding(x)
         x = self.dropout(x)
         return x
-
-
-class AttentionProjection(nn.Module):
-    def __init__(self, model_dim: int, dk: int, dv: int, device: str = "cpu"):
-        super(AttentionProjection, self).__init__()
-        self.Wq = nn.Linear(model_dim, dk, device=device)
-        self.Wk = nn.Linear(model_dim, dk, device=device)
-        self.Wv = nn.Linear(model_dim, dv, device=device)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        z: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q = self.Wq(x)
-        K = self.Wk(y) 
-        V = self.Wv(z)
-        
-        return q, K, V
-
 
 class EncoderLayer(nn.Module):
     def __init__(
