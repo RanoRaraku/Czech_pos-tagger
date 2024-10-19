@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import wandb
 from torch.optim.lr_scheduler import StepLR
+from typing import Callable, List, Optional, Tuple
 
 from Morpho import MorphoDataset
 from transformer import Transformer
